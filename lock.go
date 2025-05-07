@@ -16,6 +16,10 @@ import (
 var (
 	//go:embed script/lua/lock.lua
 	luaLock string
+	//go:embed script/lua/unlock.lua
+	luaUnlock string
+	//go:embed script/lua/refresh.lua
+	luaRefresh string
 
 	ErrFaildToPreemptLock = errors.New("rlock: failed to preempt lock")
 	ErrLockNotHold        = errors.New("rlock: lock not hold")
@@ -33,6 +37,28 @@ func NewClient(client redis.Cmdable) *Client {
 		valuer: func() string {
 			return uuid.NewString()
 		},
+	}
+}
+
+func (c *Client) SingleflightLock(ctx context.Context, key string, expiration time.Duration, retry RetryStrategy, timeout time.Duration) (*Lock, error) {
+	for {
+		flag := false
+		result := c.g.DoChan(key, func() (any, error) {
+			flag = true
+			return c.Lock(ctx, key, expiration, retry, timeout)
+		})
+		select {
+		case res := <-result:
+			if flag {
+				c.g.Forget(key)
+				if res.Err != nil {
+					return nil, res.Err
+				}
+				return res.Val.(*Lock), nil
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 }
 
@@ -115,4 +141,82 @@ func newLock(client redis.Cmdable, key string, value string, expiration time.Dur
 		expiration: expiration,
 		unlock:     make(chan struct{}, 1),
 	}
+}
+
+func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error {
+	var timer *time.Ticker
+	ch := make(chan struct{}, 1)
+	defer func() {
+		timer.Stop()
+		close(ch)
+	}()
+
+	for {
+		select {
+		case <-timer.C:
+			lctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := l.Refresh(lctx)
+			cancel()
+			if errors.Is(err, context.DeadlineExceeded) {
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		case <-ch:
+			lctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := l.Refresh(lctx)
+			cancel()
+			if errors.Is(err, context.DeadlineExceeded) {
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		case <-l.unlock:
+			return nil
+		}
+	}
+}
+
+func (l *Lock) Refresh(ctx context.Context) error {
+	res, err := l.client.Eval(ctx, luaRefresh, []string{l.key}, l.value, l.expiration.Seconds()).Int64()
+	if errors.Is(err, redis.Nil) {
+		return ErrLockNotHold
+	}
+	if err != nil {
+		return err
+	}
+	if res != 1 {
+		return ErrLockNotHold
+	}
+	return nil
+}
+
+func (l *Lock) Unlock(ctx context.Context) error {
+	res, err := l.client.Eval(ctx, luaUnlock, []string{l.key}, l.value).Int64()
+	defer func() {
+		l.signalUnlockOnce.Do(func() {
+			l.unlock <- struct{}{}
+			close(l.unlock)
+		})
+	}()
+	if errors.Is(err, redis.Nil) {
+		return ErrLockNotHold
+	}
+	if err != nil {
+		return err
+	}
+	if res != 1 {
+		return ErrLockNotHold
+	}
+	return nil
 }
