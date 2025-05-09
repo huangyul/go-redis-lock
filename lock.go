@@ -73,6 +73,7 @@ func (c *Client) Lock(ctx context.Context, key string, expiration time.Duration,
 	}()
 	for {
 		lctx, cancel := context.WithTimeout(ctx, timeout)
+
 		res, err := c.client.Eval(lctx, luaLock, []string{key}, val).Result()
 		cancel()
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
@@ -90,7 +91,7 @@ func (c *Client) Lock(ctx context.Context, key string, expiration time.Duration,
 			if err != nil {
 				err = fmt.Errorf("rlock: last retry fail: %w", err)
 			} else {
-				err = fmt.Errorf("rlock: preempt lock fail: %w", err)
+				err = fmt.Errorf("rlock: preempt lock fail")
 			}
 			return nil, err
 		}
@@ -144,7 +145,7 @@ func newLock(client redis.Cmdable, key string, value string, expiration time.Dur
 }
 
 func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error {
-	var timer *time.Ticker
+	timer := time.NewTicker(interval)
 	ch := make(chan struct{}, 1)
 	defer func() {
 		timer.Stop()
